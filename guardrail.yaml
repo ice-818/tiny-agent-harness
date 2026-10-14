@@ -1,0 +1,9 @@
+tools:
+  get_weather:
+    action: allow
+
+  calculator:
+    action: allow
+
+  query_database:
+    action: require_approval
