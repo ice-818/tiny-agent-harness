@@ -1,5 +1,9 @@
 from core.guardrail import check_tool
 from tools import TOOL_REGISTRY
+from router import ModelRouter
+import  json
+
+router = ModelRouter()
 
 def execute_tool(tool_name : str, arguments: dict):
     action = check_tool(tool_name)
@@ -15,23 +19,6 @@ def execute_tool(tool_name : str, arguments: dict):
     else:
         return f"Invalid guardrail action: {action}"
 
-def mock_llm(messages):
-    response = {
-        "type" : "tool_call",
-        "tool_name": "calculator",
-        "arguments": {
-            "a": 20,
-            "b": 30,
-            "op": "add"
-        }
-    }
-    if len(messages) == 1:
-        return response
-    else:
-        return {
-            "type" : "final",
-            "content":"50"
-        }
 
 def run(task: str, max_steps: int = 5):
     messages = [
@@ -42,17 +29,36 @@ def run(task: str, max_steps: int = 5):
     ]
     for step in range (1,max_steps + 1):
         print(f"Agent step:{step}")
-        response = mock_llm(messages)
+        response = router.chat(messages)
         if response["type"] =="tool_call":
             tool_name = response["tool_name"]
             arguments = response["arguments"]
+            tool_call_id = response["tool_call_id"]
+
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(arguments)
+                        }
+                    }
+                ]
+            })
+
             observation = execute_tool(tool_name,arguments)
+
             messages.append(
                 {
                 "role":"tool",
+                "tool_call_id": tool_call_id,
                 "content":str(observation)
                 }
             )
         if response["type"] =="final":
             return response["content"]
-print(run("帮我算20+30"))
+print(run("帮我算算20+30"))

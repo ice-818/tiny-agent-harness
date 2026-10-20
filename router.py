@@ -1,8 +1,9 @@
 import os
+import json
 
 from dotenv import load_dotenv
 from openai import OpenAI
-
+from tools import calculator_tool
 
 class ModelRouter:
     def __init__(self):
@@ -24,7 +25,7 @@ class ModelRouter:
 
         # 本地对话模型
         self.local_model = "qwen2.5:7b-instruct-q4_K_M"
-    def chat(self, message: str, task_type: str = "chat") -> str:
+    def chat(self, messages: list, task_type: str = "chat") -> dict:
         if task_type == "reasoning":
             client = self.cloud_client
             model = self.cloud_model
@@ -34,13 +35,26 @@ class ModelRouter:
 
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": message
-                }
-            ],
-            temperature=0.7
+            messages = messages,
+            temperature=0.7,
+            tools = [calculator_tool]
         )
 
-        return response.choices[0].message.content
+        message =response.choices[0].message
+
+        if message.tool_calls is None:
+            return{
+                "type": "final",
+                "content":message.content
+            }
+        else:
+            tool_name = message.tool_calls[0].function.name
+            arguments = message.tool_calls[0].function.arguments
+            arguments = json.loads(arguments)
+            tool_call_id = message.tool_calls[0].id
+            return{
+                "type":"tool_call",
+                "tool_call_id":tool_call_id,
+                "tool_name":tool_name,
+                "arguments": arguments
+            }
