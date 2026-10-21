@@ -10,3 +10,8 @@ TOOL_DEFINITIONS = [
     calculator_tool,
     get_weather_tool
 ]
+
+TOOL_SCHEMA_REGISTRY = {
+    "calculator": calculator_tool["function"]["parameters"],
+    "get_weather": get_weather_tool["function"]["parameters"]
+}

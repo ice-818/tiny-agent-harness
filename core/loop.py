@@ -1,24 +1,8 @@
-from core.guardrail import check_tool
-from tools_pkg.registry import TOOL_REGISTRY
+from tools_pkg.executor import execute_tool
 from router import ModelRouter
 import  json
 
 router = ModelRouter()
-
-def execute_tool(tool_name : str, arguments: dict):
-    action = check_tool(tool_name)
-    if action == "allow":
-        if tool_name not in TOOL_REGISTRY:
-            return f"Tool {tool_name} is not registered"
-        tool = TOOL_REGISTRY[tool_name]
-        return tool(**arguments)
-    elif action =="require_approval":
-        return f"Tool {tool_name} requires approval"
-    elif action =="deny":
-        return f"Tool {tool_name} is denied"
-    else:
-        return f"Invalid guardrail action: {action}"
-
 
 def run(task: str, max_steps: int = 5):
     messages = [
@@ -61,4 +45,6 @@ def run(task: str, max_steps: int = 5):
             )
         if response["type"] =="final":
             return response["content"]
-print(run("东京天气怎么样"))
+
+print(run("帮我算25乘以8"))
+print(run("东京天气怎么样？"))
