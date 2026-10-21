@@ -1,5 +1,5 @@
 from core.guardrail import check_tool
-from tools import TOOL_REGISTRY
+from tools_pkg.registry import TOOL_REGISTRY
 from router import ModelRouter
 import  json
 
@@ -61,4 +61,4 @@ def run(task: str, max_steps: int = 5):
             )
         if response["type"] =="final":
             return response["content"]
-print(run("帮我算算20+30"))
+print(run("东京天气怎么样"))

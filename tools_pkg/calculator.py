@@ -1,7 +1,3 @@
-def get_weather(city: str) -> str:
-    return f"{city} 当前天气：晴，26℃。"
-
-
 def calculator(a: float, b: float, op: str) -> float:
     if op == "add":
         return a + b
@@ -24,29 +20,19 @@ calculator_tool = {
         "description": "Perform basic arithmetic operations",
         "parameters": {
             "type": "object",
-            "properties":{
-                "a":{
-                    "type":"number"
+            "properties": {
+                "a": {
+                    "type": "number"
                 },
-                "b":{
-                    "type":"number"
+                "b": {
+                    "type": "number"
                 },
-                "op":{
-                    "type":"string",
-                    "enum":["add","sub","mul","div"]
+                "op": {
+                    "type": "string",
+                    "enum": ["add", "sub", "mul", "div"]
                 }
             },
-            "required":["a","b","op"]
+            "required": ["a", "b", "op"]
         }
     }
-}
-
-def query_database(sql: str) -> str:
-    return f"模拟执行数据库查询：{sql}"
-
-
-TOOL_REGISTRY = {
-    "get_weather": get_weather,
-    "calculator": calculator,
-    "query_database": query_database,
 }

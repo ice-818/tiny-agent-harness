@@ -3,7 +3,7 @@ import json
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from tools import calculator_tool
+from tools_pkg.registry import TOOL_DEFINITIONS
 
 class ModelRouter:
     def __init__(self):
@@ -37,7 +37,7 @@ class ModelRouter:
             model=model,
             messages = messages,
             temperature=0.7,
-            tools = [calculator_tool]
+            tools = TOOL_DEFINITIONS
         )
 
         message =response.choices[0].message
