@@ -1,3 +1,4 @@
+
 import json
 import time
 
@@ -12,7 +13,7 @@ router = ModelRouter()
 
 def run(task: str, max_steps: int = 5, run_id: str = None):
 
-    # 1. 初始化本次 Agent 运行
+    # 1. 初始化 Agent 运行
     is_resume = run_id is not None
 
     if run_id is None:
@@ -21,7 +22,6 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
     start_time = time.perf_counter()
     memory = MemoryManager()
 
-    # 默认从第 1 轮开始
     start_step = 1
 
     messages = [
@@ -31,7 +31,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
         }
     ]
 
-    # 如果指定了 run_id，则尝试从 Redis 恢复
+    # 2. 从已有 Checkpoint 恢复
     if is_resume:
         checkpoint = memory.get_checkpoint(run_id)
 
@@ -55,19 +55,55 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
         max_steps=max_steps
     )
 
-    # 2. Agent 主循环
+    # 3. 封装 Checkpoint 保存异常处理
+    def save_checkpoint_safely(step, next_step, status):
+        checkpoint_start = time.perf_counter()
+
+        try:
+            memory.save_checkpoint(
+                session_id=run_id,
+                step=next_step,
+                context={
+                    "messages": messages,
+                    "status": status
+                }
+            )
+
+            return True
+
+        except Exception as e:
+            duration_ms = round(
+                (time.perf_counter() - checkpoint_start) * 1000,
+                2
+            )
+
+            log_event(
+                run_id=run_id,
+                step=step,
+                event="agent_failed",
+                stage="checkpoint_save",
+                error_type=type(e).__name__,
+                duration_ms=duration_ms
+            )
+
+            return (
+                f"Agent failed: checkpoint save error "
+                f"({type(e).__name__})"
+            )
+
+    # 4. Agent 主循环
     for step in range(start_step, max_steps + 1):
 
         print(f"Agent step:{step}")
 
-        # 3. 调用 LLM，并记录耗时
+        # 5. 调用 LLM
         llm_start = time.perf_counter()
 
         try:
             response = router.chat(
                 messages,
-                run_id = run_id,
-                step = step
+                run_id=run_id,
+                step=step
             )
 
         except Exception as e:
@@ -85,7 +121,10 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 duration_ms=duration_ms
             )
 
-            return f"Agent failed: LLM call error ({type(e).__name__})"
+            return (
+                f"Agent failed: LLM call error "
+                f"({type(e).__name__})"
+            )
 
         llm_duration_ms = round(
             (time.perf_counter() - llm_start) * 1000,
@@ -100,14 +139,13 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
             response_type=response["type"]
         )
 
-        # 4. LLM 请求调用工具
+        # 6. 处理工具调用
         if response["type"] == "tool_call":
 
             tool_name = response["tool_name"]
             arguments = response["arguments"]
             tool_call_id = response["tool_call_id"]
 
-            # 将 Assistant 的工具调用加入消息历史
             messages.append(
                 {
                     "role": "assistant",
@@ -128,14 +166,14 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 }
             )
 
-            # 5. 执行工具并记录耗时
+            # 7. 执行工具
             tool_start = time.perf_counter()
 
             try:
                 observation = execute_tool(
-                tool_name,
-                arguments
-            )
+                    tool_name,
+                    arguments
+                )
 
             except Exception as e:
                 duration_ms = round(
@@ -172,7 +210,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 duration_ms=tool_duration_ms
             )
 
-            # 6. 将工具结果转换成 JSON，返回给 LLM
+            # 8. 保存工具执行结果
             messages.append(
                 {
                     "role": "tool",
@@ -184,22 +222,20 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 }
             )
 
-            memory.save_checkpoint(
-                session_id=run_id,
-                step=step + 1,
-                context={
-                    "messages": messages,
-                    "status": "running"
-                }
+            checkpoint_result = save_checkpoint_safely(
+                step=step,
+                next_step=step + 1,
+                status="running"
             )
 
-            # 继续下一轮 Agent Loop
+            if checkpoint_result is not True:
+                return checkpoint_result
+
             continue
 
-        # 7. LLM 返回最终答案
+        # 9. 处理最终回答
         elif response["type"] == "final":
 
-            # 将最终回答加入消息历史
             messages.append(
                 {
                     "role": "assistant",
@@ -207,15 +243,14 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 }
             )
 
-            # 更新 Checkpoint，标记任务已完成
-            memory.save_checkpoint(
-                session_id=run_id,
+            checkpoint_result = save_checkpoint_safely(
                 step=step,
-                context={
-                    "messages": messages,
-                    "status": "completed"
-                }
+                next_step=step,
+                status="completed"
             )
+
+            if checkpoint_result is not True:
+                return checkpoint_result
 
             total_duration_ms = round(
                 (time.perf_counter() - start_time) * 1000,
@@ -231,7 +266,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
 
             return response["content"]
 
-        # 8. 不认识的响应类型，安全终止
+        # 10. 未知响应类型
         else:
             log_event(
                 run_id=run_id,
@@ -239,10 +274,11 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 event="agent_failed",
                 stage="response_parsing",
                 error_type="unknown_response_type"
-                )
+            )
 
             return "Agent failed: unknown response type"
 
+    # 11. 超出最大执行轮数
     log_event(
         run_id=run_id,
         step=max_steps,
@@ -253,7 +289,9 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
             2
         )
     )
+
     return f"Agent stopped: exceeded max steps ({max_steps})"
+
 
 if __name__ == "__main__":
     print(run("帮我算25乘以8"))
