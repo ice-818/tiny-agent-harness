@@ -131,10 +131,31 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
             # 5. 执行工具并记录耗时
             tool_start = time.perf_counter()
 
-            observation = execute_tool(
+            try:
+                observation = execute_tool(
                 tool_name,
                 arguments
             )
+
+            except Exception as e:
+                duration_ms = round(
+                    (time.perf_counter() - tool_start) * 1000,
+                    2
+                )
+
+                log_event(
+                    run_id=run_id,
+                    step=step,
+                    event="agent_failed",
+                    stage="tool_execution",
+                    error_type=type(e).__name__,
+                    duration_ms=duration_ms
+                )
+
+                return (
+                    f"Agent failed: tool execution error "
+                    f"({type(e).__name__})"
+                )
 
             tool_duration_ms = round(
                 (time.perf_counter() - tool_start) * 1000,
