@@ -33,7 +33,30 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
 
     # 2. 从已有 Checkpoint 恢复
     if is_resume:
-        checkpoint = memory.get_checkpoint(run_id)
+        recovery_start = time.perf_counter()
+
+        try:
+            checkpoint = memory.get_checkpoint(run_id)
+
+        except Exception as e:
+            duration_ms = round(
+                (time.perf_counter() - recovery_start) * 1000,
+                2
+            )
+
+            log_event(
+                run_id=run_id,
+                step=0,
+                event="agent_failed",
+                stage="checkpoint_recovery",
+                error_type=type(e).__name__,
+                duration_ms=duration_ms
+            )
+
+            return (
+                f"Agent failed: checkpoint recovery error "
+                f"({type(e).__name__})"
+            )
 
         if checkpoint is None:
             raise ValueError(
@@ -55,7 +78,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
         max_steps=max_steps
     )
 
-    # 3. 封装 Checkpoint 保存异常处理
+    # 3. 统一处理 Checkpoint 保存异常
     def save_checkpoint_safely(step, next_step, status):
         checkpoint_start = time.perf_counter()
 
