@@ -6,10 +6,13 @@ from router import ModelRouter
 from tools_pkg.executor import execute_tool
 from core.trace import create_run_id, log_event
 from core.checkpoint_validator import validate_checkpoint, InvalidCheckpointError
-
+from core.idempotency import (
+    IdempotencyManager,
+    IdempotencyConflictError,
+)
 
 router = ModelRouter()
-
+idempotency_manager = IdempotencyManager()
 
 def run(task: str, max_steps: int = 5, run_id: str = None):
 
@@ -224,9 +227,15 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
             tool_start = time.perf_counter()
 
             try:
-                observation = execute_tool(
-                    tool_name,
-                    arguments
+                observation = idempotency_manager.execute(
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    operation=lambda: execute_tool(
+                        tool_name,
+                        arguments
+                    ),
                 )
 
             except Exception as e:
