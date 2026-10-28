@@ -1,4 +1,3 @@
-
 import json
 import time
 
@@ -6,6 +5,7 @@ from core.memory import MemoryManager
 from router import ModelRouter
 from tools_pkg.executor import execute_tool
 from core.trace import create_run_id, log_event
+from core.checkpoint_validator import validate_checkpoint, InvalidCheckpointError
 
 
 router = ModelRouter()
@@ -13,7 +13,7 @@ router = ModelRouter()
 
 def run(task: str, max_steps: int = 5, run_id: str = None):
 
-    # 1. 初始化 Agent 运行
+    # 1. Initialize the Agent run
     is_resume = run_id is not None
 
     if run_id is None:
@@ -21,6 +21,12 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
 
     start_time = time.perf_counter()
     memory = MemoryManager()
+
+    log_event(
+        run_id=run_id,
+        step=0,
+        event="agent_start"
+    )
 
     start_step = 1
 
@@ -31,7 +37,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
         }
     ]
 
-    # 2. 从已有 Checkpoint 恢复
+    # 2. Restore from an existing checkpoint
     if is_resume:
         recovery_start = time.perf_counter()
 
@@ -58,27 +64,52 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 f"({type(e).__name__})"
             )
 
+        # Preserve the existing missing-checkpoint behavior.
         if checkpoint is None:
             raise ValueError(
                 f"Checkpoint not found: {run_id}"
             )
 
-        if checkpoint["context"].get("status") != "running":
+        # A completed, structurally valid checkpoint is intentionally not resumable.
+        # Other statuses are left to the validator so malformed checkpoints fail safely.
+        if (
+                isinstance(checkpoint, dict)
+                and isinstance(checkpoint.get("context"), dict)
+                and checkpoint["context"].get("status") == "completed"
+        ):
             raise ValueError(
                 f"Checkpoint is not resumable: {run_id}"
             )
 
-        start_step = checkpoint["step"]
-        messages = checkpoint["context"]["messages"]
+        validation_start = time.perf_counter()
 
-    log_event(
-        run_id=run_id,
-        step=0,
-        event="agent_start",
-        max_steps=max_steps
-    )
+        try:
+            start_step, messages = validate_checkpoint(
+                checkpoint,
+                max_steps=max_steps
+            )
 
-    # 3. 统一处理 Checkpoint 保存异常
+        except InvalidCheckpointError as e:
+            duration_ms = round(
+                (time.perf_counter() - validation_start) * 1000,
+                2
+            )
+
+            log_event(
+                run_id=run_id,
+                step=0,
+                event="agent_failed",
+                stage="checkpoint_validation",
+                error_type=type(e).__name__,
+                duration_ms=duration_ms
+            )
+
+            return (
+                f"Agent failed: invalid checkpoint "
+                f"({type(e).__name__})"
+            )
+
+    # 3. Handle checkpoint-save errors consistently.
     def save_checkpoint_safely(step, next_step, status):
         checkpoint_start = time.perf_counter()
 
@@ -114,12 +145,12 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 f"({type(e).__name__})"
             )
 
-    # 4. Agent 主循环
+    # 4. Agent main loop
     for step in range(start_step, max_steps + 1):
 
         print(f"Agent step:{step}")
 
-        # 5. 调用 LLM
+        # 5. Call the LLM
         llm_start = time.perf_counter()
 
         try:
@@ -162,7 +193,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
             response_type=response["type"]
         )
 
-        # 6. 处理工具调用
+        # 6. Process a tool call
         if response["type"] == "tool_call":
 
             tool_name = response["tool_name"]
@@ -189,7 +220,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 }
             )
 
-            # 7. 执行工具
+            # 7. Execute the tool
             tool_start = time.perf_counter()
 
             try:
@@ -233,7 +264,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 duration_ms=tool_duration_ms
             )
 
-            # 8. 保存工具执行结果
+            # 8. Save the tool result
             messages.append(
                 {
                     "role": "tool",
@@ -256,7 +287,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
 
             continue
 
-        # 9. 处理最终回答
+        # 9. Process a final answer
         elif response["type"] == "final":
 
             messages.append(
@@ -289,7 +320,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
 
             return response["content"]
 
-        # 10. 未知响应类型
+        # 10. Unknown response type
         else:
             log_event(
                 run_id=run_id,
@@ -301,7 +332,7 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
 
             return "Agent failed: unknown response type"
 
-    # 11. 超出最大执行轮数
+    # 11. Maximum execution steps exceeded
     log_event(
         run_id=run_id,
         step=max_steps,
