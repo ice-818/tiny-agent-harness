@@ -9,15 +9,26 @@ from core.checkpoint_validator import validate_checkpoint, InvalidCheckpointErro
 from core.idempotency import (
     IdempotencyManager,
     IdempotencyConflictError,
+    IdempotencyInProgressError,
+    IdempotencyUnknownError,
+    PersistentIdempotencyManager,
 )
 
 router = ModelRouter()
-idempotency_manager = IdempotencyManager()
+idempotency_manager = PersistentIdempotencyManager()
 
-def run(task: str, max_steps: int = 5, run_id: str = None):
+def run(
+        task: str,
+        max_steps: int = 5,
+        run_id: str = None,
+        resume: bool = None,
+):
 
     # 1. Initialize the Agent run
-    is_resume = run_id is not None
+    is_resume = run_id is not None if resume is None else resume
+
+    if is_resume and run_id is None:
+        raise ValueError("run_id is required when resume=True")
 
     if run_id is None:
         run_id = create_run_id()
@@ -40,7 +51,47 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
         }
     ]
 
-    # 2. Restore from an existing checkpoint
+    # 2. Handle checkpoint-save errors consistently.
+    def save_checkpoint_safely(step, next_step, status, **extra_context):
+        checkpoint_start = time.perf_counter()
+
+        try:
+            context = {
+                "messages": messages,
+                "status": status,
+                **extra_context,
+            }
+            memory.save_checkpoint(
+                session_id=run_id,
+                step=next_step,
+                context=context,
+            )
+
+            return True
+
+        except Exception as e:
+            duration_ms = round(
+                (time.perf_counter() - checkpoint_start) * 1000,
+                2
+            )
+
+            log_event(
+                run_id=run_id,
+                step=step,
+                event="agent_failed",
+                stage="checkpoint_save",
+                error_type=type(e).__name__,
+                duration_ms=duration_ms
+            )
+
+            return (
+                f"Agent failed: checkpoint save error "
+                f"({type(e).__name__})"
+            )
+
+    # 3. Restore from a checkpoint. If the process died after a durable tool
+    # reservation but before checkpointing its observation, rebuild the state
+    # from the idempotency journal instead of executing the tool again.
     if is_resume:
         recovery_start = time.perf_counter()
 
@@ -67,86 +118,169 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                 f"({type(e).__name__})"
             )
 
-        # Preserve the existing missing-checkpoint behavior.
         if checkpoint is None:
-            raise ValueError(
-                f"Checkpoint not found: {run_id}"
-            )
+            try:
+                idempotency_recovery = idempotency_manager.get_recovery(run_id)
+            except Exception as e:
+                log_event(
+                    run_id=run_id,
+                    step=0,
+                    event="agent_failed",
+                    stage="idempotency_recovery",
+                    error_type=type(e).__name__,
+                )
+                return (
+                    f"Agent failed: idempotency recovery error "
+                    f"({type(e).__name__})"
+                )
 
-        # A completed, structurally valid checkpoint is intentionally not resumable.
-        # Other statuses are left to the validator so malformed checkpoints fail safely.
-        if (
-                isinstance(checkpoint, dict)
-                and isinstance(checkpoint.get("context"), dict)
-                and checkpoint["context"].get("status") == "completed"
-        ):
-            raise ValueError(
-                f"Checkpoint is not resumable: {run_id}"
-            )
+            # Preserve the historical error when neither persistence layer
+            # knows this run.
+            if idempotency_recovery is None:
+                raise ValueError(f"Checkpoint not found: {run_id}")
 
-        validation_start = time.perf_counter()
+            recovery = idempotency_recovery.get("recovery")
+            recovery_status = idempotency_recovery.get("status")
 
-        try:
-            start_step, messages = validate_checkpoint(
-                checkpoint,
-                max_steps=max_steps
-            )
+            if (
+                    not isinstance(recovery, dict)
+                    or type(recovery.get("step")) is not int
+                    or recovery["step"] < 1
+                    or not isinstance(recovery.get("messages"), list)
+                    or not recovery["messages"]
+            ):
+                log_event(
+                    run_id=run_id,
+                    step=0,
+                    event="agent_failed",
+                    stage="idempotency_recovery",
+                    error_type="invalid_recovery_record",
+                )
+                return "Agent failed: invalid idempotency recovery record"
 
-        except InvalidCheckpointError as e:
-            duration_ms = round(
-                (time.perf_counter() - validation_start) * 1000,
-                2
-            )
+            messages = recovery["messages"]
+            recovery_step = recovery["step"]
+            tool_call_id = idempotency_recovery["tool_call_id"]
 
-            log_event(
-                run_id=run_id,
-                step=0,
-                event="agent_failed",
-                stage="checkpoint_validation",
-                error_type=type(e).__name__,
-                duration_ms=duration_ms
-            )
+            if recovery_status == PersistentIdempotencyManager.STATUS_COMPLETED:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": json.dumps(
+                            idempotency_recovery.get("result"),
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                start_step = recovery_step + 1
+                checkpoint_result = save_checkpoint_safely(
+                    step=recovery_step,
+                    next_step=start_step,
+                    status="running",
+                    idempotency_recovery={
+                        "tool_call_id": tool_call_id,
+                        "status": recovery_status,
+                    },
+                )
+                if checkpoint_result is not True:
+                    return checkpoint_result
 
-            return (
-                f"Agent failed: invalid checkpoint "
-                f"({type(e).__name__})"
-            )
+                log_event(
+                    run_id=run_id,
+                    step=recovery_step,
+                    event="idempotency_recovered",
+                    tool_call_id=tool_call_id,
+                )
 
-    # 3. Handle checkpoint-save errors consistently.
-    def save_checkpoint_safely(step, next_step, status):
-        checkpoint_start = time.perf_counter()
+            elif recovery_status == PersistentIdempotencyManager.STATUS_UNKNOWN:
+                checkpoint_result = save_checkpoint_safely(
+                    step=recovery_step,
+                    next_step=recovery_step,
+                    status="needs_manual_reconciliation",
+                    idempotency_recovery={
+                        "tool_call_id": tool_call_id,
+                        "status": recovery_status,
+                    },
+                )
+                if checkpoint_result is not True:
+                    return checkpoint_result
 
-        try:
-            memory.save_checkpoint(
-                session_id=run_id,
-                step=next_step,
-                context={
-                    "messages": messages,
-                    "status": status
-                }
-            )
+                log_event(
+                    run_id=run_id,
+                    step=recovery_step,
+                    event="agent_stopped",
+                    reason="tool_execution_unknown",
+                    tool_call_id=tool_call_id,
+                )
+                return (
+                    "Agent stopped: tool execution state unknown; "
+                    "manual reconciliation required"
+                )
 
-            return True
+            elif recovery_status == PersistentIdempotencyManager.STATUS_IN_PROGRESS:
+                log_event(
+                    run_id=run_id,
+                    step=recovery_step,
+                    event="agent_stopped",
+                    reason="tool_execution_in_progress",
+                    tool_call_id=tool_call_id,
+                )
+                return "Agent stopped: tool execution in progress; retry later"
 
-        except Exception as e:
-            duration_ms = round(
-                (time.perf_counter() - checkpoint_start) * 1000,
-                2
-            )
+            else:
+                log_event(
+                    run_id=run_id,
+                    step=recovery_step,
+                    event="agent_failed",
+                    stage="idempotency_recovery",
+                    error_type="unsupported_idempotency_status",
+                )
+                return "Agent failed: unsupported idempotency recovery status"
 
-            log_event(
-                run_id=run_id,
-                step=step,
-                event="agent_failed",
-                stage="checkpoint_save",
-                error_type=type(e).__name__,
-                duration_ms=duration_ms
-            )
+        else:
+            # A completed checkpoint is intentionally not resumable. A known
+            # UNKNOWN outcome also cannot be retried automatically.
+            if (
+                    isinstance(checkpoint, dict)
+                    and isinstance(checkpoint.get("context"), dict)
+            ):
+                status = checkpoint["context"].get("status")
+                if status == "completed":
+                    raise ValueError(f"Checkpoint is not resumable: {run_id}")
+                if status == "needs_manual_reconciliation":
+                    return (
+                        "Agent stopped: tool execution state unknown; "
+                        "manual reconciliation required"
+                    )
 
-            return (
-                f"Agent failed: checkpoint save error "
-                f"({type(e).__name__})"
-            )
+            validation_start = time.perf_counter()
+
+            try:
+                start_step, messages = validate_checkpoint(
+                    checkpoint,
+                    max_steps=max_steps
+                )
+
+            except InvalidCheckpointError as e:
+                duration_ms = round(
+                    (time.perf_counter() - validation_start) * 1000,
+                    2
+                )
+
+                log_event(
+                    run_id=run_id,
+                    step=0,
+                    event="agent_failed",
+                    stage="checkpoint_validation",
+                    error_type=type(e).__name__,
+                    duration_ms=duration_ms
+                )
+
+                return (
+                    f"Agent failed: invalid checkpoint "
+                    f"({type(e).__name__})"
+                )
 
     # 4. Agent main loop
     for step in range(start_step, max_steps + 1):
@@ -236,7 +370,79 @@ def run(task: str, max_steps: int = 5, run_id: str = None):
                         tool_name,
                         arguments
                     ),
+                    recovery={
+                        "step": step,
+                        "messages": messages,
+                    },
                 )
+
+            except IdempotencyConflictError as e:
+                duration_ms = round(
+                    (time.perf_counter() - tool_start) * 1000,
+                    2
+                )
+
+                log_event(
+                    run_id=run_id,
+                    step=step,
+                    event="agent_failed",
+                    stage="idempotency_conflict",
+                    error_type=type(e).__name__,
+                    duration_ms=duration_ms
+                )
+
+                return "Agent failed: idempotency conflict"
+
+            except IdempotencyUnknownError as e:
+                duration_ms = round(
+                    (time.perf_counter() - tool_start) * 1000,
+                    2
+                )
+
+                checkpoint_result = save_checkpoint_safely(
+                    step=step,
+                    next_step=step,
+                    status="needs_manual_reconciliation",
+                    idempotency_recovery={
+                        "tool_call_id": tool_call_id,
+                        "status": "UNKNOWN",
+                    },
+                )
+                if checkpoint_result is not True:
+                    return checkpoint_result
+
+                log_event(
+                    run_id=run_id,
+                    step=step,
+                    event="agent_stopped",
+                    reason="tool_execution_unknown",
+                    tool_call_id=tool_call_id,
+                    error_type=type(e).__name__,
+                    duration_ms=duration_ms
+                )
+
+                return (
+                    "Agent stopped: tool execution state unknown; "
+                    "manual reconciliation required"
+                )
+
+            except IdempotencyInProgressError as e:
+                duration_ms = round(
+                    (time.perf_counter() - tool_start) * 1000,
+                    2
+                )
+
+                log_event(
+                    run_id=run_id,
+                    step=step,
+                    event="agent_stopped",
+                    reason="tool_execution_in_progress",
+                    tool_call_id=tool_call_id,
+                    error_type=type(e).__name__,
+                    duration_ms=duration_ms
+                )
+
+                return "Agent stopped: tool execution in progress; retry later"
 
             except Exception as e:
                 duration_ms = round(

@@ -60,12 +60,13 @@ class MemoryManager:
 
     def __init__(self):
         self.client = redis.Redis(
-            host="127.0.0.1",
-            port=6379,
-            db=0,
+            host=os.getenv("TINY_AGENT_REDIS_HOST", "127.0.0.1"),
+            port=int(os.getenv("TINY_AGENT_REDIS_PORT", "6379")),
+            db=int(os.getenv("TINY_AGENT_REDIS_DB", "0")),
             decode_responses=True
         )
-        self.fallback_dir = Path("data/checkpoints")
+        data_dir = Path(os.getenv("TINY_AGENT_DATA_DIR", "data"))
+        self.fallback_dir = data_dir / "checkpoints"
 
     def _validate_session_id(self, session_id: str):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
