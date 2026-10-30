@@ -1,92 +1,147 @@
 # Tiny Agent Harness
 
-一个从零搭建、可读可改的 Python Agent 运行底座。V1.0 重点不是堆功能，而是把一次工具调用从「能跑」做到「遇到重试、进程重启和存储故障时仍不会悄悄重复执行」。
+**A lightweight, recoverable Python Agent runtime — built to make tool execution observable, controllable, and safer to resume.**
 
-## V1.0 已交付
+一个从零实现的轻量级 Agent 运行框架。除了让大模型调用工具，项目更关注一个实际工程问题：**当模型超时、进程中断或存储短暂不可用时，如何恢复多步骤任务，并避免不确定的工具副作用被盲目重复执行？**
 
-- 模型路由：本地 Ollama 聊天模型与 DashScope-compatible 推理模型。
-- Agent Loop：工具调用、最大步数、可恢复 checkpoint、重试与结构化日志。
-- 工具运行器：YAML 护栏、JSON Schema 参数校验、统一观察结果。
-- Checkpoint：Redis CAS 主存储；Redis 不可用时自动落盘到本地 JSON。
-- 持久化幂等：工具调用先被原子预留，再执行；重启后已完成调用回放结果而不再执行。
-- 明确的异常语义：冲突返回 `idempotency conflict`；无法确认外部副作用时进入 `UNKNOWN`，停止并等待人工核对。
-- FastAPI：启动、查看和恢复 run 的 HTTP 接口；离线端到端演示与完整测试。
+> **定位**：适合学习 Agent 执行机制、验证恢复/幂等设计的可运行参考实现。当前为 V1.0 原型，**不建议未经加固直接用于生产环境**。
 
-## 快速验收（Windows PowerShell）
+## ✨ 核心特性
+
+| 能力 | 实现重点 |
+| --- | --- |
+| **Agent Loop** | 多轮模型推理、工具调用、观察结果回传、最大步数控制 |
+| **多模型路由** | 根据任务类型选择本地 Ollama 或 DashScope-compatible Qwen |
+| **工具安全执行** | Tool Registry / Executor、JSON Schema 参数校验、YAML 护栏 |
+| **Checkpoint 恢复** | Redis 持久化与 CAS 保护；Redis 不可用时使用本地 JSON 回退 |
+| **持久化幂等** | 工具执行前原子预留调用记录；对已完成调用回放结果 |
+| **不确定状态保护** | 对无法确认外部副作用的调用标记 `UNKNOWN`，等待人工核对，不自动重试 |
+| **工程可观测性** | 超时、有限重试、指数退避、关联 `run_id` / `step` / `attempt` 的结构化日志 |
+| **服务化与验证** | FastAPI 接口、离线端到端演示、Pytest 自动化测试 |
+
+## 🧭 设计目标
+
+许多 Agent 示例展示了「模型选择工具 → 执行工具 → 返回答案」。Tiny Agent Harness 进一步尝试回答：
+
+- 进程在工具执行前后崩溃，**下次从哪里继续**？
+- 重试时怎样**避免重复创建订单、重复发起外部操作**？
+- 如果网络断开，无法判断工具是否已执行，系统**是否应该继续重试**？
+- 当执行失败时，如何用日志和 Checkpoint **定位具体步骤**？
+
+它不是 LangGraph 等成熟框架的替代品，而是把核心执行和恢复语义做得**相对小巧、透明、便于阅读与验证**。
+
+## 🏗️ 架构概览
+
+```mermaid
+flowchart TD
+    U[User / HTTP Client] --> API[FastAPI / Agent Entry]
+    API --> LOOP[Agent Loop]
+    LOOP --> ROUTER[ModelRouter]
+    ROUTER --> LOCAL[Local Ollama]
+    ROUTER --> CLOUD[Cloud Qwen]
+    LOOP --> EXEC[Tool Registry / Executor]
+    EXEC --> CHECK[JSON Schema + YAML Guardrail]
+    CHECK --> IDEM[Persistent Idempotency]
+    IDEM --> TOOLS[Registered Tools]
+    LOOP <--> CP[Checkpoint / Run State]
+    IDEM <--> CP
+    CP --> REDIS[(Redis + CAS)]
+    CP -. Redis unavailable .-> FILE[(Local JSON fallback)]
+    LOOP --> TRACE[Structured Trace / Logs]
+```
+
+主要代码入口：
+
+| 文件 | 作用 |
+| --- | --- |
+| [`core/loop.py`](core/loop.py) | Agent 执行循环与恢复控制 |
+| [`router.py`](router.py) | 本地 / 云端模型路由与模型调用重试 |
+| [`tools_pkg/executor.py`](tools_pkg/executor.py) | 工具执行、参数校验与护栏衔接 |
+| [`core/idempotency.py`](core/idempotency.py) | 持久化幂等与工具调用状态管理 |
+| [`core/memory.py`](core/memory.py) | 会话及 Checkpoint 存储 |
+| [`core/trace.py`](core/trace.py) | 执行链路关联信息 |
+| [`api.py`](api.py) | HTTP API |
+
+## 🚀 快速运行
+
+### 方案 A：先体验离线演示（推荐）
+
+**要求：** Python 3.10+。以下示例使用 Windows PowerShell。
 
 ```powershell
-cd D:\code\tiny-agent-harness
+git clone https://github.com/ice-818/tiny-agent-harness.git
+cd tiny-agent-harness
+python -m venv venv
 .\venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+
+# 运行自动化测试
 python -m pytest -q
+
+# 运行离线端到端演示
 python demo_e2e.py
 ```
 
-`demo_e2e.py` 不会调用真实模型、Redis 或云端密钥；它会实际走一遍 HTTP API、Agent Loop、护栏、计算器工具和 checkpoint。
+`demo_e2e.py` 使用离线演示路径，不需要真实云端 API Key、Ollama 服务或 Redis 服务；它覆盖 HTTP API、Agent Loop、工具护栏、计算器工具与 Checkpoint 的主要流程。
 
-## 启动 API
+### 方案 B：启动本地 API
 
-先复制环境变量示例并按需要填写：
+先创建本地环境配置：
 
 ```powershell
 Copy-Item .env.example .env
 python -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
-访问 `http://127.0.0.1:8000/docs` 使用交互式接口，或在另一个 PowerShell 中调用：
+在浏览器中打开 **http://127.0.0.1:8000/docs** 查看 FastAPI 自动生成的交互式 API 文档。
 
-```powershell
-$body = @{
-  task = "请使用 calculator 工具计算 25 乘以 8"
-  max_steps = 5
-} | ConvertTo-Json
+如果要运行真实模型：本地聊天路由需要启动相应 Ollama 模型；云端推理路由需要在 `.env` 中设置自己的 `DASHSCOPE_API_KEY`。**不要提交 `.env` 或实际密钥。**
 
-Invoke-RestMethod http://127.0.0.1:8000/runs `
-  -Method Post -ContentType "application/json" -Body $body
-```
+## 🔁 故障恢复与幂等：项目的关键设计
 
-返回值含 `run_id`。在模型或进程中断后，可恢复尚未完成的 run：
+一次工具调用可能产生外部副作用，例如创建订单。不能把「请求没有收到响应」简单等同于「操作没有执行」。
 
-```powershell
-$resume = @{ max_steps = 5 } | ConvertTo-Json
-Invoke-RestMethod http://127.0.0.1:8000/runs/<run_id>/resume `
-  -Method Post -ContentType "application/json" -Body $resume
-```
+因此，项目区分三类工具调用状态：
 
-查询 checkpoint 状态：
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/runs/<run_id>
-```
-
-## 工具调用恢复语义
-
-| 记录状态 | 系统行为 | 是否自动重试 |
+| 状态 | 恢复时的处理 | 是否自动重复执行工具 |
 | --- | --- | --- |
-| `COMPLETED` | 回放已保存的工具观察结果，并继续下一轮 | 否，不会重复执行 |
-| `IN_PROGRESS` | 返回“稍后重试”，避免并发 worker 双跑 | 否 |
-| `UNKNOWN` | run 变为 `needs_manual_reconciliation` | **绝不自动重试** |
+| `COMPLETED` | 回放已保存的工具观察结果，继续 Agent Loop | **否** |
+| `IN_PROGRESS` | 提示稍后重试，避免并发执行同一调用 | **否** |
+| `UNKNOWN` | 将 run 标记为 `needs_manual_reconciliation`，等待人工核对外部系统 | **否** |
 
-`UNKNOWN` 代表调用边界外可能已经产生副作用、但进程无法确认结果。例如向支付或订单系统发送请求后网络断开。此时应先在外部系统按业务 ID 核对，再决定是否补偿或重试。
+**为什么需要 `UNKNOWN`？** 假设创建订单请求已经发送出去，但网络在响应返回前断开。此时本地无法证明订单是否已创建；盲目重试可能造成重复订单。因此框架采取保守策略：**停止自动重试，等待人工核对业务状态**。
 
-## 存储与配置
+Redis 负责主要状态存储与 CAS 并发保护；当 Redis 不可用时，框架支持将恢复数据写入本地 JSON。**本地回退不等于跨机器高可用**，多实例协调仍需要合适的共享存储与部署设计。
 
-`.env.example` 中的配置：
+## 🧪 测试与验证
 
-- `TINY_AGENT_REDIS_HOST` / `PORT` / `DB`：Redis 为 checkpoint 和幂等记录的主存储。
-- `TINY_AGENT_DATA_DIR`：Redis 不可用时本地 JSON 的持久化目录，默认 `data/`。
-- `DASHSCOPE_API_KEY`：仅云端推理模型需要。默认聊天路由使用本地 Ollama。
+```powershell
+python -m pytest -q
+python demo_e2e.py
+```
 
-生产部署、TLS、备份、安全边界与限制请见 [部署说明](docs/deployment.md)。
+项目 V1.0 开发时记录的测试结果为 **53 项测试通过**；请以当前克隆版本实际执行 `pytest` 的输出为准。
 
-## 兼容性
+重点测试包括：模型路由、工具参数校验、权限拒绝、Agent Loop、重试、Checkpoint 恢复、幂等状态与 API 行为。相应测试位于 [`tests/`](tests/) 目录。
 
-原有 `run(task, max_steps=5, run_id=None)` 调用仍可用，传入 `run_id` 时仍按恢复语义处理。新增的 `resume=False` 只供 API 在指定新 `run_id` 时显式创建任务使用。原有 in-process `IdempotencyManager` 也保留；Agent Loop 在 V1.0 默认使用 `PersistentIdempotencyManager`。
+## 🔐 安全与适用边界
 
-## 建议学习顺序
+- YAML 护栏与 JSON Schema 校验可以约束已注册工具的输入和调用，但不能替代外部系统的权限管理。
+- `UNKNOWN` 状态需要人工与外部业务系统核对；对于有副作用的生产工具，建议同时使用**外部业务幂等键**。
+- V1.0 API **不内置身份认证、租户隔离、限流或后台任务队列**。不要直接把未加保护的 API 暴露在公网。
+- 本地 JSON 回退更适合单机恢复场景；需要按业务要求配置备份、保留期限和数据保护。
+- 公开仓库只保留 [`.env.example`](.env.example) 配置模板；真实密钥请置于本地环境变量或安全的密钥管理系统。
 
-1. 从 `tools_pkg/executor.py` 看护栏、Schema 校验和统一工具结果。
-2. 阅读 `core/loop.py`，对照一次正常工具调用与 checkpoint 保存顺序。
-3. 阅读 `core/idempotency.py` 中 `COMPLETED / IN_PROGRESS / UNKNOWN` 的状态机。
-4. 运行 `demo_e2e.py`，再阅读对应测试：`tests/test_api.py`、`tests/test_persistent_idempotency.py`、`tests/test_loop_v1_recovery.py`。
-5. 最后接入真实模型与 Redis，并用 `/docs` 操作一次完整 run 与恢复。
+部署细节与限制参见 [`docs/deployment.md`](docs/deployment.md)。
+
+## 📚 建议阅读顺序
+
+1. [`tools_pkg/executor.py`](tools_pkg/executor.py)：了解工具如何被校验与执行。
+2. [`core/loop.py`](core/loop.py)：理解模型调用、工具观察及 Checkpoint 的执行顺序。
+3. [`core/idempotency.py`](core/idempotency.py)：理解 `COMPLETED`、`IN_PROGRESS`、`UNKNOWN` 状态语义。
+4. [`demo_e2e.py`](demo_e2e.py) 与 [`tests/`](tests/)：通过演示和测试验证恢复行为。
+5. [`api.py`](api.py)：了解如何通过 HTTP 启动、查看和恢复 run。
+
+---
+
+**项目目标：把 Agent 从「调用工具成功一次」推进到「在异常场景下仍能解释、恢复和安全停止」。**
